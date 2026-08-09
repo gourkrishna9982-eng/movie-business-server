@@ -1,0 +1,13 @@
+{
+  "name": "movie-business-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Movie Business 3 save/load backend (zero dependencies)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

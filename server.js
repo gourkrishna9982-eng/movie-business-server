@@ -184,6 +184,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ---- root path: lets Render's health check (and you, in a browser)
+    // confirm the service is actually up and serving this code ----
+    if (req.method === 'GET' && url.pathname === '/') {
+      sendJSON(res, 200, { ok: true, service: 'movie-business-server' });
+      return;
+    }
+
     sendJSON(res, 404, { error: 'Not found' });
   } catch (err) {
     console.error(err);
