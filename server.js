@@ -1,63 +1,103 @@
 /**
- * Movie Business 3 — Save/Load Backend
- * ------------------------------------
- * Zero external dependencies. Uses only Node's built-in "http" and "fs" modules.
+ * Movie Business 3 — Save/Load Backend (Render web service + Supabase PostgreSQL)
+ * ---------------------------------------------------------------------------
+ * Persistent storage: PostgreSQL, hosted on Supabase. The web service itself
+ * still runs on Render — only the database moved off Render's ephemeral
+ * filesystem to Supabase's managed, persistent Postgres.
  *
- * Run:   node server.js
- * (optional) PORT env var to change the port, defaults to 3000.
+ * The HTTP endpoints, request bodies, and response shapes are UNCHANGED
+ * from the previous versions — only the storage layer's connection changed.
  *
- * Storage: a single JSON file (database.json) next to this script, keyed by
- * lowercased/trimmed email address. Each entry holds one player's complete
- * saved gameState object exactly as sent by the client.
+ * Required env var (set on Render, never in the frontend):
+ *   DATABASE_URL   - Supabase connection string (see setup notes below)
+ * Optional:
+ *   PORT           - Render sets this automatically; do not hardcode it.
  *
  * Endpoints:
  *   POST /api/login  { email }                -> { isNewUser, hasSave, gameState|null }
  *   POST /api/load    { email }                -> { hasSave, gameState|null }
- *   POST /api/save    { email, gameState }     -> { success: true, savedAt }
- *
- * Writes are atomic (write to a temp file, then rename) so a crash mid-write
- * can never corrupt the database file.
+ *   POST /api/save    { email, gameState }     -> { success: true, savedAt, saveVersion }
+ *   GET  /api/health                           -> { ok, database, timestamp }
  */
 
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, 'database.json');
-const TMP_FILE = DB_FILE + '.tmp';
+
+if (!process.env.DATABASE_URL) {
+  console.error('FATAL: DATABASE_URL environment variable is not set.');
+  console.error('Add it in Render → your web service → Environment, using the');
+  console.error('connection string from your Supabase project (Project Settings');
+  console.error('→ Database → Connection string → "Connection pooling" URI).');
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // Supabase's Postgres is reached over the public internet (Render and
+  // Supabase are different providers), so unlike Render's own internal
+  // Postgres, this connection MUST use SSL. Supabase's certificate chain
+  // isn't in Node's default trust store, so rejectUnauthorized is disabled
+  // here the same way Supabase's own connection examples show.
+  ssl: { rejectUnauthorized: false }
+});
 
 const EMAIL_RE = /^[a-zA-Z0-9._%+-]+@gmail\.com$/;
 
-// ---------- tiny "database" ----------
-
-function loadDB() {
-  try {
-    const raw = fs.readFileSync(DB_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch (err) {
-    if (err.code === 'ENOENT') return {}; // first run, no file yet
-    console.error('Failed to read database.json, starting with an empty DB:', err.message);
-    return {};
-  }
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS saves (
+      email TEXT PRIMARY KEY,
+      game_state JSONB NOT NULL,
+      save_version INTEGER NOT NULL DEFAULT 1,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  // Lightweight backup table: keeps the previous version of each save
+  // before it's overwritten, so a bad save is always recoverable.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS saves_backup (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      game_state JSONB NOT NULL,
+      save_version INTEGER NOT NULL,
+      backed_up_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS saves_backup_email_idx ON saves_backup (email, backed_up_at DESC)`);
 }
-
-function saveDB(db) {
-  const json = JSON.stringify(db, null, 2);
-  fs.writeFileSync(TMP_FILE, json, 'utf8');
-  fs.renameSync(TMP_FILE, DB_FILE); // atomic on POSIX filesystems
-}
-
-// In-memory cache, persisted to disk on every write. Simple + fine for a
-// single-process indie-game backend. Swap loadDB/saveDB for a real DB later
-// without touching any of the route handlers below.
-let db = loadDB();
 
 function normalizeEmail(email) {
   return String(email || '').trim().toLowerCase();
 }
 
-// ---------- HTTP plumbing ----------
+// A save is only valid if it actually has content — this is what stops a
+// broken/empty client request from clobbering a real save.
+function isValidGameState(gameState) {
+  if (typeof gameState !== 'object' || gameState === null || Array.isArray(gameState)) return false;
+  if (Object.keys(gameState).length === 0) return false;
+  return true;
+}
+
+// Keep only the last N backups per player so the backup table doesn't grow
+// forever.
+const MAX_BACKUPS_PER_PLAYER = 10;
+async function pruneBackups(email) {
+  await pool.query(
+    `DELETE FROM saves_backup
+     WHERE email = $1
+       AND id NOT IN (
+         SELECT id FROM saves_backup
+         WHERE email = $1
+         ORDER BY backed_up_at DESC
+         LIMIT $2
+       )`,
+    [email, MAX_BACKUPS_PER_PLAYER]
+  );
+}
+
+// ---------- HTTP plumbing (unchanged) ----------
 
 function sendJSON(res, statusCode, body) {
   const json = JSON.stringify(body);
@@ -98,9 +138,6 @@ function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  // Browsers send a CORS "preflight" OPTIONS request before the actual
-  // POST when the request has a JSON body — it must get a bare 204 with
-  // no body, otherwise the browser blocks the real request that follows.
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -128,12 +165,12 @@ const server = http.createServer(async (req, res) => {
         sendJSON(res, 400, { error: 'Please provide a valid Gmail address' });
         return;
       }
-      const entry = db[email];
-      if (entry) {
-        sendJSON(res, 200, { isNewUser: false, hasSave: true, gameState: entry.gameState });
+      const { rows } = await pool.query('SELECT game_state FROM saves WHERE email = $1', [email]);
+      if (rows.length > 0) {
+        sendJSON(res, 200, { isNewUser: false, hasSave: true, gameState: rows[0].game_state });
       } else {
-        // IMPORTANT: do NOT create anything here. Per spec, only NEW STUDIO
-        // (after the player fills the create-studio form) creates a save.
+        // No record for this account. Only NEW STUDIO creation (via
+        // /api/save after the create-studio form) should ever create one.
         sendJSON(res, 200, { isNewUser: true, hasSave: false, gameState: null });
       }
       return;
@@ -147,9 +184,9 @@ const server = http.createServer(async (req, res) => {
         sendJSON(res, 400, { error: 'Please provide a valid Gmail address' });
         return;
       }
-      const entry = db[email];
-      if (entry) {
-        sendJSON(res, 200, { hasSave: true, gameState: entry.gameState });
+      const { rows } = await pool.query('SELECT game_state FROM saves WHERE email = $1', [email]);
+      if (rows.length > 0) {
+        sendJSON(res, 200, { hasSave: true, gameState: rows[0].game_state });
       } else {
         sendJSON(res, 200, { hasSave: false, gameState: null });
       }
@@ -164,28 +201,76 @@ const server = http.createServer(async (req, res) => {
         sendJSON(res, 400, { error: 'Please provide a valid Gmail address' });
         return;
       }
-      if (typeof body.gameState !== 'object' || body.gameState === null) {
-        sendJSON(res, 400, { error: 'Missing gameState' });
+      if (!isValidGameState(body.gameState)) {
+        // Reject instead of overwriting — never let a bad/empty payload
+        // destroy a good save.
+        sendJSON(res, 400, { error: 'Missing or empty gameState — save rejected to protect existing data' });
         return;
       }
-      db[email] = {
-        email,
-        gameState: body.gameState,
-        updatedAt: new Date().toISOString()
-      };
-      saveDB(db);
-      sendJSON(res, 200, { success: true, savedAt: db[email].updatedAt });
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+
+        const existing = await client.query(
+          'SELECT game_state, save_version FROM saves WHERE email = $1 FOR UPDATE',
+          [email]
+        );
+
+        // Back up whatever the previous save was, before overwriting it.
+        if (existing.rows.length > 0) {
+          await client.query(
+            'INSERT INTO saves_backup (email, game_state, save_version) VALUES ($1, $2, $3)',
+            [email, existing.rows[0].game_state, existing.rows[0].save_version]
+          );
+        }
+
+        const nextVersion = existing.rows.length > 0 ? existing.rows[0].save_version + 1 : 1;
+
+        const result = await client.query(
+          `INSERT INTO saves (email, game_state, save_version, updated_at)
+           VALUES ($1, $2, $3, now())
+           ON CONFLICT (email) DO UPDATE SET
+             game_state = EXCLUDED.game_state,
+             save_version = EXCLUDED.save_version,
+             updated_at = now()
+           RETURNING updated_at, save_version`,
+          [email, JSON.stringify(body.gameState), nextVersion]
+        );
+
+        await client.query('COMMIT');
+        await pruneBackups(email);
+
+        sendJSON(res, 200, {
+          success: true,
+          savedAt: result.rows[0].updated_at,
+          saveVersion: result.rows[0].save_version
+        });
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
       return;
     }
 
     // ---- health check ----
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      sendJSON(res, 200, { ok: true, players: Object.keys(db).length });
+      try {
+        const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM saves');
+        sendJSON(res, 200, {
+          ok: true,
+          database: 'postgres',
+          players: rows[0].n,
+          timestamp: new Date().toISOString()
+        });
+      } catch (err) {
+        sendJSON(res, 500, { ok: false, database: 'postgres', error: 'Database is not responding' });
+      }
       return;
     }
 
-    // ---- root path: lets Render's health check (and you, in a browser)
-    // confirm the service is actually up and serving this code ----
     if (req.method === 'GET' && url.pathname === '/') {
       sendJSON(res, 200, { ok: true, service: 'movie-business-server' });
       return;
@@ -194,14 +279,25 @@ const server = http.createServer(async (req, res) => {
     sendJSON(res, 404, { error: 'Not found' });
   } catch (err) {
     console.error(err);
+    // A server-side failure must NEVER be reported as "no save" — that would
+    // make the frontend show "No saved studio yet" for a player who actually
+    // has one. Always surface it as a real error instead.
     sendJSON(res, 500, { error: err.message || 'Server error' });
   }
 });
 
-// Bind explicitly to 0.0.0.0 (not just "localhost") so the VPS accepts
-// connections coming from the public internet, not only from itself.
 const HOST = '0.0.0.0';
-server.listen(PORT, HOST, () => {
-  console.log(`Movie Business 3 save server listening on ${HOST}:${PORT}`);
-  console.log(`Database file: ${DB_FILE}`);
-});
+initDb()
+  .then(() => {
+    server.listen(PORT, HOST, () => {
+      console.log(`Movie Business 3 save server listening on ${HOST}:${PORT}`);
+      console.log('Database: PostgreSQL (Supabase)');
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });
+
+process.on('SIGTERM', () => { pool.end(); process.exit(0); });
+process.on('SIGINT', () => { pool.end(); process.exit(0); });

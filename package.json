@@ -1,11 +1,14 @@
 {
   "name": "movie-business-server",
-  "version": "1.0.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "Movie Business 3 save/load backend (zero dependencies)",
+  "description": "Movie Business 3 save/load backend (PostgreSQL persistent storage on Render)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
   },
   "engines": {
     "node": ">=18"
